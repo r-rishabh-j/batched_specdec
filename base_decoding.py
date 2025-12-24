@@ -1,12 +1,13 @@
+from math import inf
 import torch
 from torch.nn import Module
-from utils.logits_processor import LogitsProcessor, GreedyProcessor
-import utils.printing as printing
+from .logits_processor import LogitsProcessor, GreedyProcessor
+from . import printing
 from typing import List
 
 
 @torch.no_grad()
-def autoregressive_generate_encoder_decoder(
+def autoregressive_generate(
     inputs: List[int],
     model: Module,
     max_gen_len: int = 40,
@@ -32,36 +33,30 @@ def autoregressive_generate_encoder_decoder(
         List[int]: generated sequence.
 
     Note:
-        This generation methods only works for encoder-decoder models.
+        This generation methods only works for decoder-only models.
     """
     cache = None
-    prompt = torch.tensor(inputs, dtype=torch.long, device=model.device).unsqueeze(0)
     prompt_len = len(inputs)
-
-    decoder_start_token = model.config.decoder_start_token_id
-
     # prepare input tensor
-    max_sequece_length = 1024
-    total_len = min(max_sequece_length - prompt_len - 1, max_gen_len + 1)
-    decoded_ids = torch.full(
-        (1, total_len), pad_token_id, dtype=torch.long, device=model.device
-    )
-    decoded_ids[0, 0] = decoder_start_token
+    max_seq_length = model.config.max_position_embeddings if hasattr(model.config, 'max_position_embeddings') else (model.config.max_context_length if hasattr(model.config, 'max_context_length') else 1024)
+    total_len = min(max_seq_length, prompt_len + max_gen_len)
+    input_ids = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=model.device)
+    input_ids[0, :prompt_len] = torch.tensor(inputs, dtype=torch.long, device=model.device)
 
-    list_tokens_id = (eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id])
+    list_tokens_id = (
+        eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id]
+    )
     stop_tokens = torch.tensor(list_tokens_id, dtype=torch.long, device=model.device)
 
-    for curr in range(1, total_len):
-        o = model(
-            input_ids=prompt,
-            decoder_input_ids=decoded_ids[..., :curr],
-            past_key_values=cache,
-            use_cache=use_cache,
-        )
+    for curr in range(prompt_len, total_len):
+        if use_cache:
+            o = model(input_ids[..., curr-1:curr], past_key_values=cache, use_cache=use_cache)
+        else:
+            o = model(input_ids[..., :curr], past_key_values=cache, use_cache=use_cache)
         logits = o.logits[..., -1, :]  # [1, vocab_size]
         probs = logits_processor(logits)  # [1, vocab_size]
         x = logits_processor.sample(probs)  # [1, 1]
-        decoded_ids[0, curr] = x
+        input_ids[0, curr] = x
         cache = o.past_key_values
 
         # check for end token
@@ -70,4 +65,4 @@ def autoregressive_generate_encoder_decoder(
                 printing.end_token_found(curr)
             break
 
-    return decoded_ids[0, : curr + 1].tolist()
+    return input_ids[0, prompt_len : curr + 1].tolist()

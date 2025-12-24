@@ -1,13 +1,13 @@
 # Speculative Decoding
 
 This repository is a pytorch implementation of Speculative Decoding / Speculative Sampling ([Leviathan et al., 2023](#1); [Chen et al., 2023](#2)).
-It contains the code for three generation strategies: classic auto-regressive decoding, beam search decoding (with length penalty) and speculative decoding. Auto-regressive decoding and Speculative Decoding can be used in a greedy or nucleus sampling (temperature, top k and top p) setting.
+It contains the code for three generation strategies: classic auto-regressive decoding, speculative decoding with draft and batched speculative decoding. Auto-regressive decoding and Speculative Decoding can be used in a greedy or nucleus sampling (temperature, top k and top p) setting.
 
-<p align="center">
+<!-- <p align="center">
     <img src="figures/example.png" alt="Example of generation." width="600"/>
     <br>
     <em>Figure 1: Example of generation, comparing Speculative Decoding and Vanilla Decoding. The difference of text is due to the pseudo-random estimation of computers.</em>
-</p>
+</p> -->
 
 ## What is Speculative Decoding?
 

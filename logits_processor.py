@@ -22,7 +22,6 @@ class LogitsProcessor(abc.ABC):
     def sample(self, probs: Tensor) -> Tensor:
         pass
 
-
 class GreedyProcessor(LogitsProcessor):
     """Greedy: Most probable token."""
 
@@ -33,7 +32,7 @@ class GreedyProcessor(LogitsProcessor):
         return logits
 
     def sample(self, probs: Tensor) -> Tensor:
-        return torch.argmax(probs, dim=-1).unsqueeze(-1)
+        return torch.argmax(probs, dim=-1)
 
 
 class MultinomialProcessor(LogitsProcessor):
