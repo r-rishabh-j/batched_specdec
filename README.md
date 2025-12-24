@@ -142,43 +142,6 @@ output_ids_bs = beam_search_generate(
             )
 ```
 
-### 2. Run console interface Inference
-
-You can run `infer.py` in your console to generate text using the console interface. You can easily change the hyperparameters of the generation, compare target and speculative generation, enable drafter generation and much more.
-
-```bash
-python infer.py
-```
-
-To change the models used, you can change the `target_model_name` and `drafter_model_name` in the `infer.py` file.
-Be careful to change the generate methods to encoder-decoder models if you are using encoder-decoder models.
-
-## Additional content: Ngram Assisted Speculative Decoding 
-
-On top of this implementation, one of the works of my MSc thesis is implemented: **Ngram Assisted Speculative Decoding** (NASD). NASD replaces the drafter model of Speculative Decoding with an $N$-Gram Storage. The $N$-Gram Storage is a count of $k$-grams with $k \in [2, N]$. This storage takes an $N-1$ tokens context and returns the most probable next token from the highest seen $k$-gram, and `None` if the context has never been seen.
-Before generation, the $N$-Gram Storage is filled with all the $k$-grams of the prompt. During generation, the $N$-Gram Storage is used to generate drafts and updated with the accepted drafts and the target model's predictions.
-
-The advantage of NASD is that it allows for faster generation without the need for a second model. It is training-free and task- and model-agnostic, making it a versatile approach for accelerating sequence generation in transformers.
-
-As I did not published this work, a similar approach as been introduced later in NAPD ([Ou et al., 2024](#3)).
-To reproduce their results, you can use the NASD implementation by simply setting `top_k_filler=1`.
-
-*The documentation of NASD will be published soon...*
-
-<p align="center">
-    <img src="figures/nasd_method.png" alt="Overview of NASD method." width="600"/>
-    <br>
-    <em>Figure 3: Overview of NASD method.</em>
-</p>
-
-## Known issues
-### Cache feature
-The cache feature is very inconsistent and sometimes incorrectly implemented in huggingface transformers (mainly depending on the model). This can lead to incorrect results or even errors when using the cache feature. To avoid this issue, you can disable the cache feature by setting `use_cache=False` in the generate methods. This will slow down the generation but will avoid any cache-related issues.
-
-## Did you find any bug?
-
-Please open an issue or submit a pull request if you find any bug. Contributions are welcome!
-
 ## References
 <a id="1">[1]</a> Leviathan, Y., Kalman, M. &amp; Matias, Y.. (2023). Fast Inference from Transformers via Speculative Decoding. <i>Proceedings of the 40th International Conference on Machine Learning</i>, in <i>Proceedings of Machine Learning Research</i> 202:19274-19286 Available from https://proceedings.mlr.press/v202/leviathan23a.html.
 
