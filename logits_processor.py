@@ -45,7 +45,7 @@ class MultinomialProcessor(LogitsProcessor):
         return logits
 
     def sample(self, probs: Tensor) -> Tensor:
-        return torch.multinomial(probs, num_samples=1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 class TopKProcessor(MultinomialProcessor):

@@ -22,6 +22,178 @@ def max_fn(x: torch.Tensor) -> torch.Tensor:
     x_max_sum = torch.sum(x_max, dim=-1, keepdim=True)
     return x_max / x_max_sum
 
+@torch.no_grad()
+def speculative_generate_batch(
+    batch_inputs: List[List[int]],
+    drafter: Module,
+    target: Module,
+    tokenizer = None,
+    gamma: int = 5,
+    logits_processor: LogitsProcessor = GreedyProcessor(),
+    max_gen_len: int = 40,
+    eos_tokens_id: int | List[int] = 1,
+    pad_token_id: int = 0,
+    skip_sample_adjustment: bool = False,
+    collect_stats: bool = False,
+    debug: bool = True ):
+    """
+    Batched speculative decoding for variable-length prompts.
+    This implementation ignores kv caching and instead relies on attention masks.
+    Returns generated sequences, per-sample acceptance rates, and optional stats.
+    """
+    B = len(batch_inputs)
+    batch_indexer = torch.arange(B)
+    # fix our constants
+    device = target.device
+    max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
+    max_seq_length=max_seq_length - 1 # leave space for a possible bonus token in the end
+    prompt_lens = torch.tensor([len(prompt) for prompt in batch_inputs], device=device)
+    max_prompt_len = int(prompt_lens.max().item())
+    max_total_length = int(min(max_seq_length, max_prompt_len+max_gen_len))
+
+    start_positions = prompt_lens.clone() # hold start pointers for next token fill for each batch element
+    # create input tensor for the model in input_ids
+    input_ids = torch.full((B, max_total_length), pad_token_id, dtype=torch.long, device=device)
+    for b, prompt in enumerate(batch_inputs):
+        input_ids[b,:len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
+
+    drafts_accepted = torch.zeros(B, device=device)
+    drafts_speculated = torch.zeros(B, device=device)
+
+    def attention_mask(start_positions: torch.Tensor):
+        """
+        create an attention mask for batch of prompt of length given by start_positions
+        """
+        max_prompt_len = start_positions.max().item()
+        # uses broadcasting here to expand positions to batch dim then the length dim
+        positions = torch.arange(max_prompt_len, device=device).unsqueeze(0)
+        mask = positions < (start_positions).unsqueeze(1)
+        return max_prompt_len, mask
+
+    # generate the first token from target
+    max_prompt_len, attn_mask = attention_mask(start_positions)
+    target_logits = target(
+        input_ids = input_ids[:, :max_prompt_len],
+        attention_mask = attn_mask,
+        use_cache=False
+    ).logits
+    # get new token from end of output Mp and put in input_ids
+    new_tok_probs = logits_processor(target_logits[batch_indexer, start_positions-1])
+    # sample from target distribution
+    new_token_batch = logits_processor.sample(new_tok_probs)
+    input_ids[batch_indexer, start_positions]=new_token_batch
+    # move pointers one step ahead
+    start_positions+=1
+
+    # store which prompts are now terminated, either by exceeding max len 
+    # or that eos token has been reached
+    active_status = start_positions < max_total_length
+    active_status &= (new_token_batch != eos_tokens_id)
+
+    vocab_size = int(target.config.vocab_size)
+
+    # buffers to store prob outputs from draft and target
+    Q = torch.zeros(size=(B, gamma, vocab_size), device=device, dtype=target.dtype) # draft
+    # +1 for bonus token
+    P = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target.dtype) # target
+
+    # run loop untill all sequences terminated
+    while torch.any(active_status) and int(start_positions.max().item()) < max_total_length:
+        # process only those sequences which are active
+        active_indices = active_status.nonzero().squeeze(-1)
+        num_active = len(active_indices)
+        max_current = start_positions[active_indices].max().item()
+        draft_steps = int(min(gamma, max_total_length - max_current - 1))
+        if draft_steps <= 0:
+            break
+
+        Q.fill_(0)
+        P.fill_(0)
+        # use drafter to generate draft_steps tokens
+        for k in range(draft_steps):
+            gen_indices = start_positions[active_indices]+k
+            max_seq_length, attn_mask = attention_mask(start_positions[active_indices] + k) # add k to include draft step
+            draft_logits = drafter(
+                input_ids=input_ids[active_indices, :max_seq_length],
+                attn_mask=attn_mask,
+                use_cache=False
+            ).logits
+            # get the last logit batch from model output
+            Q[active_indices, k] = logits_processor(draft_logits[torch.arange(num_active), gen_indices-1]) # -1 for left shift
+            # sample from this batch of next tokens
+            new_token_batch = logits_processor.sample(Q[active_indices, k])
+            # write to input IDs
+            input_ids[active_indices, gen_indices]=new_token_batch
+
+        drafts_speculated[active_indices] += draft_steps
+
+        # run the generated drafts through the target model
+        # the drafts are contained in input_ids
+        max_seq_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
+        target_logits = target(
+            input_ids=input_ids[active_indices, :max_seq_length],
+            attn_mask=verification_mask,
+            use_cache=False
+        ).logits
+        # gather generated logits
+        # get indices to gather. 
+        # start positions get broadcasted to match len, draft steps to batch
+        indices_to_verify = start_positions[active_indices].unsqueeze(1) + torch.arange(draft_steps+1, device=device).unsqueeze(0) - 1 # -1 for left shift
+        # expand to match vocab dim for torch.gather to work
+        indices_to_verify = indices_to_verify.unsqueeze(-1).expand(-1, -1, vocab_size)
+        # gather the subsequences corresponding to the drafts
+        # +1 to include possible bonus token
+        P[active_indices, :draft_steps+1] = logits_processor(torch.gather(target_logits, dim=1, index=indices_to_verify))
+
+        # run verify loop over batch elements
+        for b_idx in active_indices.tolist():
+            drafted_tokens = input_ids[b_idx, start_positions[b_idx]:start_positions[b_idx]+draft_steps]
+            # get probs for target and draft
+            eps = 1e-12
+            q = torch.clamp(Q[b_idx, torch.arange(draft_steps), drafted_tokens], min=eps)
+            p = torch.clamp(P[b_idx, torch.arange(draft_steps), drafted_tokens], min=eps)
+            log_ratio = torch.log(p) - torch.log(q)
+            log_r = torch.log(torch.rand(draft_steps, device=device) + eps)
+
+            num_accepted=0
+            for i in range(draft_steps):
+                accepted = log_r[i]<=log_ratio[i]
+                if not accepted:
+                    break
+                num_accepted+=1
+
+            drafts_accepted[b_idx] += num_accepted
+
+            accepted_draft = drafted_tokens[:num_accepted]
+            stop_hits = torch.isin(accepted_draft, eos_tokens_id).nonzero(as_tuple=False)
+            if stop_hits.numel() > 0:
+                stop_at = stop_hits[0].item()
+                active_status[b_idx] = False
+                start_positions[b_idx] = start_positions[b_idx] + stop_at + 1
+                continue
+            
+            extra_token_prob = P[b_idx, num_accepted]
+            if num_accepted < draft_steps:
+                if not skip_sample_adjustment:
+                    extra_token_prob = max_fn(extra_token_prob - Q[b_idx, num_accepted])
+                # remove rejected tokens from input_ids
+                input_ids[b_idx, start_positions[b_idx]+num_accepted:start_positions[b_idx]+draft_steps]=pad_token_id
+            extra_token = logits_processor.sample(extra_token_prob)
+            input_ids[b_idx, start_positions[b_idx]+num_accepted]=extra_token
+            start_positions[b_idx]+=num_accepted+1
+            if extra_token == eos_tokens_id:
+                active_status[b_idx]=False
+        
+    outputs = []
+    acc_rates = []
+    for i in range(B):
+        end = min(int(start_positions[i].item()), max_total_length)
+        outputs.append(input_ids[i, prompt_lens[i]:end].tolist())
+        denom = drafts_speculated[i].item() if drafts_speculated[i].item() > 0 else 1e-10
+        acc_rates.append((drafts_accepted[i] / denom).item())
+    
+    return outputs, acc_rates, []
+
 
 @torch.no_grad()
 def speculative_generate(
@@ -192,180 +364,3 @@ def speculative_generate(
             return input_ids[0, prompt_len:current_position].tolist(), drafts_accepted / drafts_speculated
     
     return input_ids[0, prompt_len:].tolist(), drafts_accepted / drafts_speculated
-
-
-@torch.no_grad()
-def speculative_generate_batch(
-    batch_inputs: List[List[int]],
-    drafter: Module,
-    target: Module,
-    tokenizer = None,
-    gamma: int = 5,
-    logits_processor: LogitsProcessor = GreedyProcessor(),
-    max_gen_len: int = 40,
-    eos_tokens_id: int | List[int] = 1,
-    pad_token_id: int = 0,
-    skip_sample_adjustment: bool = False,
-    collect_stats: bool = False,
-    debug: bool = True ):
-    """
-    Batched speculative decoding for variable-length prompts.
-    This implementation ignores kv caching and instead relies on attention masks.
-    Returns generated sequences, per-sample acceptance rates, and optional stats.
-    """
-    B = len(batch_inputs)
-    batch_indexer = torch.arange(B)
-    # fix our constants
-    device = target.device
-    max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
-    max_seq_length=max_seq_length - 1 # leave space for a possible bonus token in the end
-    prompt_lens = torch.tensor([len(prompt) for prompt in batch_inputs], device=device)
-    max_prompt_len = int(prompt_lens.max().item())
-    max_total_length = int(min(max_seq_length, max_prompt_len+max_gen_len))
-
-    start_positions = prompt_lens.clone() # hold start pointers for next token fill for each batch element
-    # create input tensor for the model in input_ids
-    input_ids = torch.full((B, max_total_length), pad_token_id, dtype=torch.long, device=device)
-    for b, prompt in enumerate(batch_inputs):
-        input_ids[b,:len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
-    
-    # active_status = start_positions < max_total_length
-
-    drafts_accepted = torch.zeros(B, device=device)
-    drafts_speculated = torch.zeros(B, device=device)
-
-    def attention_mask(start_positions: torch.Tensor):
-        """
-        create an attention mask for batch of prompt of length given by start_positions
-        """
-        max_prompt_len = start_positions.max().item()
-        # uses broadcasting here to expand positions to batch dim then the length dim
-        positions = torch.arange(max_prompt_len, device=device).unsqueeze(0)
-        mask = positions < (start_positions).unsqueeze(1)
-        return max_prompt_len, mask
-
-    # generate the first token from target
-    max_prompt_len, attn_mask = attention_mask(start_positions)
-    target_logits = target(
-        input_ids = input_ids[:, :max_prompt_len],
-        attention_mask = attn_mask,
-        use_cache=False
-    ).logits
-    # get new token from end of output Mp and put in input_ids
-    new_tok_probs = logits_processor(target_logits[batch_indexer, start_positions-1])
-    # sample from target distribution
-    new_token_batch = logits_processor.sample(new_tok_probs).squeeze()
-    # print(new_token_batch)
-    input_ids[batch_indexer, start_positions]=new_token_batch
-    # move pointers one step ahead
-    start_positions+=1
-
-    # store which prompts are now terminated, either by exceeding max len 
-    # or that eos token has been reached
-    active_status = start_positions < max_total_length
-    active_status &= (new_token_batch != eos_tokens_id)
-
-    vocab_size = int(target.config.vocab_size)
-
-    # buffers to store prob outputs from draft and target
-    Q = torch.zeros(size=(B, gamma, vocab_size), device=device, dtype=target.dtype) # draft
-    # +1 for bonus token
-    P = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target.dtype) # target
-
-    # run loop untill all sequences terminated
-    while torch.any(active_status) and int(start_positions.max().item()) < max_total_length:
-        # process only those sequences which are active
-        active_indices = active_status.nonzero().squeeze(-1)
-        num_active = len(active_indices)
-        max_current = start_positions[active_indices].max().item()
-        draft_steps = int(min(gamma, max_total_length - max_current - 1))
-        if draft_steps <= 0:
-            break
-
-        Q.fill_(0)
-        P.fill_(0)
-        # use drafter to generate draft_steps tokens
-        for k in range(draft_steps):
-            print('Draft step', k+1, 'of', draft_steps)
-            gen_indices = start_positions[active_indices]+k
-            max_seq_length, attn_mask = attention_mask(start_positions[active_indices] + k) # add k to include draft step
-            draft_logits = drafter(
-                input_ids=input_ids[active_indices, :max_seq_length],
-                attn_mask=attn_mask,
-                use_cache=False
-            ).logits
-            # get the last logit batch from model output
-            Q[active_indices, k] = logits_processor(draft_logits[torch.arange(num_active), gen_indices-1]) # -1 for left shift
-            # sample from this batch of next tokens
-            new_token_batch = logits_processor.sample(Q[active_indices, k]).squeeze()
-            # write to input IDs
-            input_ids[active_indices, gen_indices]=new_token_batch
-
-        drafts_speculated[active_indices] += draft_steps
-
-        # run the generated drafts through the target model
-        # the drafts are contained in input_ids
-        max_seq_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
-        target_logits = target(
-            input_ids=input_ids[active_indices, :max_seq_length],
-            attn_mask=verification_mask,
-            use_cache=False
-        ).logits
-        # gather generated logits
-        # get indices to gather. 
-        # start positions get broadcasted to match len, draft steps to batch
-        indices_to_verify = start_positions[active_indices].unsqueeze(1) + torch.arange(draft_steps+1, device=device).unsqueeze(0) - 1 # -1 for left shift
-        # expand to match vocab dim for torch.gather to work
-        indices_to_verify = indices_to_verify.unsqueeze(-1).expand(-1, -1, vocab_size)
-        # gather the subsequences corresponding to the drafts
-        # +1 to include possible bonus token
-        P[active_indices, :draft_steps+1] = logits_processor(torch.gather(target_logits, dim=1, index=indices_to_verify))
-
-        # run verify loop over batch elements
-        for b_idx in active_indices.tolist():
-            drafted_tokens = input_ids[b_idx, start_positions[b_idx]:start_positions[b_idx]+draft_steps]
-            # get probs for target and draft
-            eps = 1e-12
-            q = torch.clamp(Q[b_idx, torch.arange(draft_steps), drafted_tokens], min=eps)
-            p = torch.clamp(P[b_idx, torch.arange(draft_steps), drafted_tokens], min=eps)
-            log_ratio = torch.log(p) - torch.log(q)
-            log_r = torch.log(torch.rand(draft_steps, device=device) + eps)
-
-            num_accepted=0
-            for i in range(draft_steps):
-                accepted = log_r[i]<=log_ratio[i]
-                if not accepted:
-                    break
-                num_accepted+=1
-
-            drafts_accepted[b_idx] += num_accepted
-
-            accepted_draft = drafted_tokens[:num_accepted]
-            stop_hits = torch.isin(accepted_draft, eos_tokens_id).nonzero(as_tuple=False)
-            if stop_hits.numel() > 0:
-                stop_at = stop_hits[0].item()
-                active_status[b_idx] = False
-                start_positions[b_idx] = start_positions[b_idx] + stop_at + 1
-                continue
-            
-            extra_token_prob = P[b_idx, num_accepted]
-            if num_accepted < draft_steps:
-                if not skip_sample_adjustment:
-                    extra_token_prob = max_fn(extra_token_prob - Q[b_idx, num_accepted])
-                # remove rejected tokens from input_ids
-                input_ids[b_idx, start_positions[b_idx]+num_accepted:start_positions[b_idx]+draft_steps]=pad_token_id
-            extra_token = logits_processor.sample(extra_token_prob).squeeze()
-            input_ids[b_idx, start_positions[b_idx]+num_accepted]=extra_token
-            start_positions[b_idx]+=num_accepted+1
-            if extra_token == eos_tokens_id:
-                active_status[b_idx]=False
-        
-    outputs = []
-    acc_rates = []
-    for i in range(B):
-        end = min(int(start_positions[i].item()), max_total_length)
-        outputs.append(input_ids[i, prompt_lens[i]:end].tolist())
-        denom = drafts_speculated[i].item() if drafts_speculated[i].item() > 0 else 1e-10
-        acc_rates.append((drafts_accepted[i] / denom).item())
-    
-    return outputs, acc_rates, []
