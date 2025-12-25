@@ -11,7 +11,7 @@ def prune_cache(cache, cache_len):
     cache.crop(cache_len)
     return cache
 
-def max_fn(x: torch.Tensor) -> torch.Tensor:
+def prob_norm(x: torch.Tensor) -> torch.Tensor:
     """
     Max function.
         x: input tensor.
@@ -53,7 +53,7 @@ def speculative_generate_batch(
 
     start_positions = prompt_lens.clone() # hold start pointers for next token fill for each batch element
     # create input tensor for the model in input_ids
-    input_ids = torch.full((B, max_total_length), pad_token_id, dtype=torch.long, device=device)
+    input_ids = torch.full((B, max_total_length+1), pad_token_id, dtype=torch.long, device=device)
     for b, prompt in enumerate(batch_inputs):
         input_ids[b,:len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
 
@@ -175,7 +175,7 @@ def speculative_generate_batch(
             extra_token_prob = P[b_idx, num_accepted]
             if num_accepted < draft_steps:
                 if not skip_sample_adjustment:
-                    extra_token_prob = max_fn(extra_token_prob - Q[b_idx, num_accepted])
+                    extra_token_prob = prob_norm(extra_token_prob - Q[b_idx, num_accepted])
                 # remove rejected tokens from input_ids
                 input_ids[b_idx, start_positions[b_idx]+num_accepted:start_positions[b_idx]+draft_steps]=pad_token_id
             extra_token = logits_processor.sample(extra_token_prob)
@@ -342,7 +342,7 @@ def speculative_generate(
                 target_cache = prune_cache(target_cache, current_position + n +1)
 
             if not skip_sample_adjustment:
-                p_p = max_fn(p[..., n, :] - q[0, n, :])
+                p_p = prob_norm(p[..., n, :] - q[0, n, :])
             else:
                 p_p = p[..., n, :]
         x = logits_processor.sample(p_p)
