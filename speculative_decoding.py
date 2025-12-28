@@ -92,10 +92,8 @@ def speculative_generate_batch(
 
     vocab_size = int(target.config.vocab_size)
 
-    # buffers to store prob outputs from draft and target
-    Q = torch.zeros(size=(B, gamma, vocab_size), device=device, dtype=target.dtype) # draft
-    # +1 for bonus token
-    P = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target.dtype) # target
+    # buffers to store prob outputs from draft and target, redundant +1 for batching
+    Q = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target.dtype) # draft
 
     # run loop untill all sequences terminated
     while torch.any(active_status) and int(start_positions.max().item()) < max_total_length:
@@ -108,8 +106,8 @@ def speculative_generate_batch(
             break
 
         Q.fill_(0)
-        P.fill_(0)
         # use drafter to generate draft_steps tokens
+        # draft_active = torch.clone(active_indices)
         for k in range(draft_steps):
             gen_indices = start_positions[active_indices]+k
             max_seq_length, attn_mask = attention_mask(start_positions[active_indices] + k) # add k to include draft step
@@ -121,7 +119,9 @@ def speculative_generate_batch(
             # get the last logit batch from model output
             Q[active_indices, k] = logits_processor(draft_logits[torch.arange(num_active), gen_indices-1]) # -1 for left shift
             # sample from this batch of next tokens
+            # new_token_batch = logits_processor.sample(Q[active_indices, k])
             new_token_batch = logits_processor.sample(Q[active_indices, k])
+            # new_token_batch = torch.where(draft_active, new_token_batch, pad_token_id)
             # write to input IDs
             input_ids[active_indices, gen_indices]=new_token_batch
 
@@ -135,54 +135,52 @@ def speculative_generate_batch(
             attn_mask=verification_mask,
             use_cache=False
         ).logits
-        # gather generated logits
-        # get indices to gather. 
-        # start positions get broadcasted to match len, draft steps to batch
-        indices_to_verify = start_positions[active_indices].unsqueeze(1) + torch.arange(draft_steps+1, device=device).unsqueeze(0) - 1 # -1 for left shift
-        # expand to match vocab dim for torch.gather to work
-        indices_to_verify = indices_to_verify.unsqueeze(-1).expand(-1, -1, vocab_size)
-        # gather the subsequences corresponding to the drafts
-        # +1 to include possible bonus token
-        P[active_indices, :draft_steps+1] = logits_processor(torch.gather(target_logits, dim=1, index=indices_to_verify))
 
-        # run verify loop over batch elements
-        for b_idx in active_indices.tolist():
-            drafted_tokens = input_ids[b_idx, start_positions[b_idx]:start_positions[b_idx]+draft_steps]
-            # get probs for target and draft
-            eps = 1e-12
-            q = torch.clamp(Q[b_idx, torch.arange(draft_steps), drafted_tokens], min=eps)
-            p = torch.clamp(P[b_idx, torch.arange(draft_steps), drafted_tokens], min=eps)
-            log_ratio = torch.log(p) - torch.log(q)
-            log_r = torch.log(torch.rand(draft_steps, device=device) + eps)
+        eps = 1e-12
 
-            num_accepted=0
-            for i in range(draft_steps):
-                accepted = log_r[i]<=log_ratio[i]
-                if not accepted:
-                    break
-                num_accepted+=1
+        q = Q[active_indices, :draft_steps+1].clamp(min=eps)
+        # create an index array to gather draft probs and tokens. Include an extra position for bonus token
+        drafted_indices = start_positions[active_indices].unsqueeze(1) + torch.arange(draft_steps+1, device=device)
+        drafted_tokens=input_ids[active_indices.unsqueeze(1), drafted_indices[:,:-1]]
+        # expand to match vocab dim for collecting target probs, -1 for left shift of model probs
+        p = logits_processor(target_logits[torch.arange(num_active).unsqueeze(1), drafted_indices-1]).clamp(min=eps)
+        p_tok = p[torch.arange(num_active).unsqueeze(1), torch.arange(draft_steps).unsqueeze(0), drafted_tokens]
+        q_tok = q[torch.arange(num_active).unsqueeze(1), torch.arange(draft_steps).unsqueeze(0), drafted_tokens]
 
-            drafts_accepted[b_idx] += num_accepted
+        log_ratio = torch.log(p_tok) - torch.log(q_tok)
+        log_r = torch.log(torch.rand(log_ratio.shape, device=device))
+        # Find first rejection (vectorized cumulative product)
+        # take cumsum of accepted_mask, the first false breaks the chain
+        acceptance_status = (log_r<=log_ratio).cumprod(dim=1).to(dtype=bool)  # [num_active, draft_steps+1]
+        num_accepted = acceptance_status.sum(dim=1)  # [num_active]
+        drafts_accepted[active_indices] += num_accepted
 
-            accepted_draft = drafted_tokens[:num_accepted]
-            stop_hits = torch.isin(accepted_draft, eos_tokens_id).nonzero(as_tuple=False)
-            if stop_hits.numel() > 0:
-                stop_at = stop_hits[0].item()
-                active_status[b_idx] = False
-                start_positions[b_idx] = start_positions[b_idx] + stop_at + 1
-                continue
-            
-            extra_token_prob = P[b_idx, num_accepted]
-            if num_accepted < draft_steps:
-                if not skip_sample_adjustment:
-                    extra_token_prob = max_fn(extra_token_prob - Q[b_idx, num_accepted])
-                # remove rejected tokens from input_ids
-                input_ids[b_idx, start_positions[b_idx]+num_accepted:start_positions[b_idx]+draft_steps]=pad_token_id
-            extra_token = logits_processor.sample(extra_token_prob)
-            input_ids[b_idx, start_positions[b_idx]+num_accepted]=extra_token
-            start_positions[b_idx]+=num_accepted+1
-            if extra_token == eos_tokens_id:
-                active_status[b_idx]=False
+        active_idx_rejected, rejected_idx = torch.where(~acceptance_status)
+        rejected_positions = drafted_indices[active_idx_rejected, rejected_idx]
+        input_ids[active_indices[active_idx_rejected], rejected_positions] = pad_token_id
+
+        # perform resampling of last token - bonus or extra
+        # mask for those sequences in which first extra token needs re-sampling
+        extra_token_prob = p[active_indices, num_accepted]
+        if not skip_sample_adjustment:
+            q_at_rejection = q[active_indices, num_accepted]
+            extra_token_prob = torch.where((num_accepted<draft_steps).unsqueeze(1), extra_token_prob, max_fn(extra_token_prob-q_at_rejection))
+        # sample extra tokens, includes bonus tokens
+        extra_tokens = logits_processor.sample(extra_token_prob)
+        input_ids[active_indices, start_positions[active_indices]+num_accepted]=extra_tokens
+
+        # find eos token and update active status, start positions
+        drafted_tokens=input_ids[active_indices.unsqueeze(1), drafted_indices]
+        eos_hits = torch.isin(drafted_tokens, eos_tokens_id)
+        eos_positions = torch.where(eos_hits, torch.arange(draft_steps+1, device=device).unsqueeze(0), max_seq_length).min(dim=1).values
+        has_eos = eos_positions <= draft_steps
+        active_indices &= ~has_eos
+        # correct lengths
+        start_positions[active_indices] = torch.where(
+            has_eos,
+            start_positions[active_indices]+eos_positions+1, 
+            start_positions[active_indices]+num_accepted+1
+        )
         
     outputs = []
     acc_rates = []
