@@ -164,7 +164,7 @@ def speculative_generate_batch(
         extra_token_prob = p[active_indices, num_accepted]
         if not skip_sample_adjustment:
             q_at_rejection = q[active_indices, num_accepted]
-            extra_token_prob = torch.where((num_accepted<draft_steps).unsqueeze(1), extra_token_prob, max_fn(extra_token_prob-q_at_rejection))
+            extra_token_prob = torch.where((num_accepted<draft_steps).unsqueeze(1), extra_token_prob, prob_norm(extra_token_prob-q_at_rejection))
         # sample extra tokens, includes bonus tokens
         extra_tokens = logits_processor.sample(extra_token_prob)
         input_ids[active_indices, start_positions[active_indices]+num_accepted]=extra_tokens
