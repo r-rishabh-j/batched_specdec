@@ -46,7 +46,6 @@ def speculative_generate_batch(
     # fix our constants
     device = target.device
     max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
-    max_seq_length=max_seq_length - 1 # leave space for a possible bonus token in the end
     prompt_lens = torch.tensor([len(prompt) for prompt in batch_inputs], device=device)
     max_prompt_len = int(prompt_lens.max().item())
     max_total_length = int(min(max_seq_length, max_prompt_len+max_gen_len))
@@ -110,9 +109,9 @@ def speculative_generate_batch(
         # draft_active = torch.clone(active_indices)
         for k in range(draft_steps):
             gen_indices = start_positions[active_indices]+k
-            max_seq_length, attn_mask = attention_mask(start_positions[active_indices] + k) # add k to include draft step
+            max_length, attn_mask = attention_mask(start_positions[active_indices] + k) # add k to include draft step
             draft_logits = drafter(
-                input_ids=input_ids[active_indices, :max_seq_length],
+                input_ids=input_ids[active_indices, :max_length],
                 attn_mask=attn_mask,
                 use_cache=False
             ).logits
@@ -129,9 +128,10 @@ def speculative_generate_batch(
 
         # run the generated drafts through the target model
         # the drafts are contained in input_ids
-        max_seq_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
+        max_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
+
         target_logits = target(
-            input_ids=input_ids[active_indices, :max_seq_length],
+            input_ids=input_ids[active_indices, :max_length],
             attn_mask=verification_mask,
             use_cache=False
         ).logits
@@ -161,9 +161,9 @@ def speculative_generate_batch(
 
         # perform resampling of last token - bonus or extra
         # mask for those sequences in which first extra token needs re-sampling
-        extra_token_prob = p[active_indices, num_accepted]
+        extra_token_prob = p[torch.arange(num_active), num_accepted]
         if not skip_sample_adjustment:
-            q_at_rejection = q[active_indices, num_accepted]
+            q_at_rejection = q[torch.arange(num_active), num_accepted]
             extra_token_prob = torch.where((num_accepted<draft_steps).unsqueeze(1), extra_token_prob, prob_norm(extra_token_prob-q_at_rejection))
         # sample extra tokens, includes bonus tokens
         extra_tokens = logits_processor.sample(extra_token_prob)
@@ -174,13 +174,14 @@ def speculative_generate_batch(
         eos_hits = torch.isin(drafted_tokens, eos_tokens_id)
         eos_positions = torch.where(eos_hits, torch.arange(draft_steps+1, device=device).unsqueeze(0), max_seq_length).min(dim=1).values
         has_eos = eos_positions <= draft_steps
-        active_indices &= ~has_eos
         # correct lengths
         start_positions[active_indices] = torch.where(
             has_eos,
             start_positions[active_indices]+eos_positions+1, 
             start_positions[active_indices]+num_accepted+1
         )
+        active_status[active_indices] &= ~has_eos
+
         
     outputs = []
     acc_rates = []
