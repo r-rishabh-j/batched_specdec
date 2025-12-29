@@ -55,18 +55,19 @@ def speculative_generate_batch(
     # create input tensor for the model in input_ids
     input_ids = torch.full((B, max_total_length+1), pad_token_id, dtype=torch.long, device=device)
     for b, prompt in enumerate(batch_inputs):
-        input_ids[b,:len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
+        input_ids[b, :len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
 
     drafts_accepted = torch.zeros(B, device=device)
     drafts_speculated = torch.zeros(B, device=device)
 
-    def attention_mask(start_positions: torch.Tensor):
+    def attention_mask(start_positions: torch.Tensor, margin=0):
         """
         create an attention mask for batch of prompt of length given by start_positions
+        margin: add extra space for drafting
         """
         max_prompt_len = start_positions.max().item()
         # uses broadcasting here to expand positions to batch dim then the length dim
-        positions = torch.arange(max_prompt_len, device=device).unsqueeze(0)
+        positions = torch.arange(max_prompt_len+margin, device=device).unsqueeze(0)
         mask = positions < (start_positions).unsqueeze(1)
         return max_prompt_len, mask
 
@@ -108,33 +109,39 @@ def speculative_generate_batch(
 
         Q.fill_(0)
         # use drafter to generate draft_steps tokens
-        # draft_active = torch.clone(active_indices)
+        draft_active = torch.full((num_active,), True, device=device)
+        draft_lengths = torch.full_like(active_indices, 0, device=device)
+        next_indices = start_positions[active_indices].clone()
+        max_length, attn_mask = attention_mask(next_indices, margin=draft_steps)
         for k in range(draft_steps):
-            gen_indices = start_positions[active_indices]+k
-            max_length, attn_mask = attention_mask(start_positions[active_indices] + k) # add k to include draft step
+            # modify mask
             draft_logits = drafter(
                 input_ids=input_ids[active_indices, :max_length],
-                attn_mask=attn_mask,
+                attn_mask=attn_mask[:, :max_length],
                 use_cache=False
             ).logits
             # get the last logit batch from model output
-            Q[active_indices, k] = logits_processor(draft_logits[active_indexer, gen_indices-1]) # -1 for left shift
+            Q[active_indices, k] = logits_processor(draft_logits[active_indexer, next_indices-1]) # -1 for left shift
             # sample from this batch of next tokens
-            # new_token_batch = logits_processor.sample(Q[active_indices, k])
             new_token_batch = logits_processor.sample(Q[active_indices, k])
-            # new_token_batch = torch.where(draft_active, new_token_batch, pad_token_id)
+            new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+            draft_active &= (new_token_batch != eos_tokens_id)
             # write to input IDs
-            input_ids[active_indices, gen_indices]=new_token_batch
+            input_ids[active_indices, next_indices]=new_token_batch
+            draft_lengths+=draft_active
+            attn_mask[active_indexer, next_indices]=True
+            next_indices+=1
+            max_length+=1
 
-        drafts_speculated[active_indices] += draft_steps
+        drafts_speculated[active_indices] += draft_lengths
 
         # run the generated drafts through the target model
         # the drafts are contained in input_ids
-        max_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
+        # max_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
 
         target_logits = target(
             input_ids=input_ids[active_indices, :max_length],
-            attn_mask=verification_mask,
+            attn_mask=attn_mask,
             use_cache=False
         ).logits
 
