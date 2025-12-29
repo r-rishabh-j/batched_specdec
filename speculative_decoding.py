@@ -41,10 +41,11 @@ def speculative_generate_batch(
     This implementation ignores kv caching and instead relies on attention masks.
     Returns generated sequences, per-sample acceptance rates, and optional stats.
     """
+    device = target.device
+    vocab_size = int(target.config.vocab_size)
     B = len(batch_inputs)
     batch_indexer = torch.arange(B)
-    # fix our constants
-    device = target.device
+
     max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') \
         else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
     prompt_lens = torch.tensor([len(prompt) for prompt in batch_inputs], device=device)
@@ -63,7 +64,7 @@ def speculative_generate_batch(
     def attention_mask(start_positions: torch.Tensor, margin=0):
         """
         create an attention mask for batch of prompt of length given by start_positions
-        margin: add extra space for drafting
+        margin: add extra space for draft tokens
         """
         max_prompt_len = start_positions.max().item()
         # uses broadcasting here to expand positions to batch dim then the length dim
@@ -91,8 +92,6 @@ def speculative_generate_batch(
     active_status = start_positions < max_total_length
     active_status &= (new_token_batch != eos_tokens_id)
 
-    vocab_size = int(target.config.vocab_size)
-
     # buffers to store prob outputs from draft and target, redundant +1 for batching
     Q = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target.dtype) # draft
 
@@ -112,9 +111,10 @@ def speculative_generate_batch(
         draft_active = torch.full((num_active,), True, device=device)
         draft_lengths = torch.full_like(active_indices, 0, device=device)
         next_indices = start_positions[active_indices].clone()
+        # attn mask for autoregressive drafting
+        # mask and len updated in loop
         max_length, attn_mask = attention_mask(next_indices, margin=draft_steps)
         for k in range(draft_steps):
-            # modify mask
             draft_logits = drafter(
                 input_ids=input_ids[active_indices, :max_length],
                 attn_mask=attn_mask[:, :max_length],
@@ -124,45 +124,45 @@ def speculative_generate_batch(
             Q[active_indices, k] = logits_processor(draft_logits[active_indexer, next_indices-1]) # -1 for left shift
             # sample from this batch of next tokens
             new_token_batch = logits_processor.sample(Q[active_indices, k])
+            # ignore tokens for inactive drafts
             new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+            # make those drafts inactive which have eos
             draft_active &= (new_token_batch != eos_tokens_id)
             # write to input IDs
             input_ids[active_indices, next_indices]=new_token_batch
             draft_lengths+=draft_active
+            # update mask and lengths to accomodate generated tokens in next loop
             attn_mask[active_indexer, next_indices]=True
             next_indices+=1
             max_length+=1
 
         drafts_speculated[active_indices] += draft_lengths
 
-        # run the generated drafts through the target model
-        # the drafts are contained in input_ids
-        # max_length, verification_mask = attention_mask(start_positions[active_indices] + draft_steps) # add draft steps to include the draft
-
+        # parallel verification of drafted tokens
         target_logits = target(
             input_ids=input_ids[active_indices, :max_length],
             attn_mask=attn_mask,
             use_cache=False
         ).logits
 
+        # eps for avoiding NaN
         eps = 1e-12
 
-        q = Q[active_indices, :draft_steps+1].clamp(min=eps)
+        q = Q[active_indices, :draft_steps+1].clamp(min=eps) # [num_active, draft_steps+1, vocab_size]
         # create an index array to gather draft probs and tokens. Include an extra position for bonus token
-        drafted_indices=start_positions[active_indices].unsqueeze(1) + torch.arange(draft_steps+1, device=device)
-        drafted_tokens=input_ids[active_indices.unsqueeze(1), drafted_indices[:,:-1]]
+        drafted_indices=start_positions[active_indices].unsqueeze(1) + torch.arange(draft_steps+1, device=device) # [num_active, draft_steps+1]
+        drafted_tokens=input_ids[active_indices.unsqueeze(1), drafted_indices[:,:-1]] # [num_active, draft_steps]
         # -1 for left shift of model probs
-        p = logits_processor(target_logits[active_indexer.unsqueeze(1), drafted_indices-1]).clamp(min=eps)
-        p_tok = p[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1)
-        q_tok = q[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1)
+        p = logits_processor(target_logits[active_indexer.unsqueeze(1), drafted_indices-1]).clamp(min=eps) # [num_active, draft_steps+1, vocab_size]
+        p_tok = p[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1) # [num_active, draft_steps]
+        q_tok = q[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1) # [num_active, draft_steps]
 
         log_ratio = torch.log(p_tok) - torch.log(q_tok)
         log_r = torch.log(torch.rand(log_ratio.shape, device=device))
         # Find first rejection (vectorized cumulative product)
         # take cumsum of accepted_mask, the first false breaks the chain
-        acceptance_status = (log_r<=log_ratio).cumprod(dim=1).to(dtype=bool)  # [num_active, draft_steps+1]
-        num_accepted = acceptance_status.sum(dim=1)  # [num_active]
-        drafts_accepted[active_indices] += num_accepted
+        acceptance_status = (log_r<=log_ratio).cumprod(dim=1).to(dtype=bool)  # [num_active, draft_steps]
+        num_accepted = acceptance_status.sum(dim=1)  # [num_active,]
 
         active_idx_rejected, rejected_idx = torch.where(~acceptance_status)
         rejected_positions = drafted_indices[active_idx_rejected, rejected_idx]
@@ -175,7 +175,7 @@ def speculative_generate_batch(
             q_at_rejection = q[active_indexer, num_accepted]
             extra_token_prob = torch.where(
                 (num_accepted<draft_steps).unsqueeze(1),
-                torch.nn.functional.relu(extra_token_prob-q_at_rejection)+eps,
+                torch.nn.functional.relu(extra_token_prob-q_at_rejection)+eps, # max(0, p-q)
                 extra_token_prob
             )
         # sample extra tokens, includes bonus tokens
@@ -183,21 +183,25 @@ def speculative_generate_batch(
         input_ids[active_indices, start_positions[active_indices]+num_accepted]=extra_tokens
 
         # find eos token and update active status, start positions
-        drafted_tokens = input_ids[active_indices.unsqueeze(1), drafted_indices]
+        drafted_tokens = input_ids[active_indices.unsqueeze(1), drafted_indices] # includes bonus token
         eos_hits = torch.isin(drafted_tokens, eos_tokens_id)
         eos_positions = torch.where(
             eos_hits,
             torch.arange(draft_steps+1, device=device),
             max_seq_length
         ).min(dim=1).values
-        has_eos = eos_positions <= draft_steps
+        # has_eos = eos_positions <= draft_steps
+        has_eos = eos_positions <= num_accepted
+        # update active sequences
+        active_status[active_indices]&=~has_eos
         # correct lengths
-        start_positions[active_indices] += torch.where(
+        len_update = torch.where(
             has_eos,
-            eos_positions+1, 
-            num_accepted+1
+            eos_positions, 
+            num_accepted
         )
-        active_status[active_indices] &= ~has_eos
+        drafts_accepted[active_indices]+=len_update
+        start_positions[active_indices]+=len_update+1 # includes extra/bonus token
         
     outputs = []
     acc_rates = []
