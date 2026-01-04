@@ -3,12 +3,6 @@
 This repository is a pytorch implementation of Speculative Decoding / Speculative Sampling ([Leviathan et al., 2023](#1); [Chen et al., 2023](#2)).
 It contains the code for three generation strategies: classic auto-regressive decoding, speculative decoding with draft and batched speculative decoding. Auto-regressive decoding and Speculative Decoding can be used in a greedy or nucleus sampling (temperature, top k and top p) setting.
 
-<!-- <p align="center">
-    <img src="figures/example.png" alt="Example of generation." width="600"/>
-    <br>
-    <em>Figure 1: Example of generation, comparing Speculative Decoding and Vanilla Decoding. The difference of text is due to the pseudo-random estimation of computers.</em>
-</p> -->
-
 ## What is Speculative Decoding?
 
 Speculative Decoding is a decoding strategy for transformers that allows to generate sequences faster than the classic auto-regressive decoding without changing the output distribution or requiring further fine-tuning. It uses a smaller, more efficient approximation model (called a "drafter") to generate speculative token prefixes. These prefixes are then evaluated in parallel by the larger target model, reducing the number of serial decoding steps required and leading to inference speedups.
@@ -20,6 +14,16 @@ The core process rely on the specific behavior of the Transformer model that all
     <br>
     <em>Figure 2: Overview of Speculative Decoding.</em>
 </p>
+
+## Batched Speculative Decoding
+
+<p align="center">
+    <img src="figures/specdec-gif.gif" alt="Batched Speculative Decoding" width="700"/>
+    <br>
+    <em>Figure 3: Batched Speculative Decoding</em>
+</p>
+
+
 
 ## How to use
 
