@@ -1,7 +1,14 @@
-# Speculative Decoding
+# Batched Speculative Decoding
 
-This repository is a pytorch implementation of Speculative Decoding / Speculative Sampling ([Leviathan et al., 2023](#1); [Chen et al., 2023](#2)).
-It contains the code for three generation strategies: classic auto-regressive decoding, speculative decoding with draft and batched speculative decoding. Auto-regressive decoding and Speculative Decoding can be used in a greedy or nucleus sampling (temperature, top k and top p) setting.
+This repository is a PyTorch implementation of Speculative Decoding / Speculative Sampling ([Leviathan et al., 2023](#1); [Chen et al., 2023](#2)).
+It contains the code for three generation strategies: classic auto-regressive decoding, speculative decoding with draft and batched speculative decoding.
+
+We support speculative decoding with
+
+- Prompt batching
+- Non-uniform acceptance lengths
+- Parallel verification of drafts enabling scalable evaluation of model alignment approaches (refer [distillSpec](https://github.com/r-rishabh-j/distillSpec))
+
 
 ## What is Speculative Decoding?
 
@@ -16,7 +23,7 @@ The core process rely on the specific behavior of the Transformer model that all
 </p>
 
 ## Batched Speculative Decoding
-
+Sample run of Qwen3-4B-Instruct as target, Qwen3-0.6B as drafter with a batch size of 40 on NVIDIA H100.
 <p align="center">
     <img src="figures/specdec-gif.gif" alt="Batched Speculative Decoding" width="700"/>
     <br>
@@ -41,9 +48,9 @@ accelerate
 bitsandbytes
 ```
 
-Simply fork this repository and install the dependencies.
+### 1. Generate text
 
-### 1. Generate text using Speculative Decoding
+Run the provided sample script `main.py`, or follow the instructions below:
 
 #### a. Load the target and drafter model
 
