@@ -8,6 +8,7 @@ We support speculative decoding with
 - Prompt batching
 - Non-uniform acceptance lengths
 - Parallel verification of drafts enabling scalable evaluation of model alignment approaches (refer [distillSpec](https://github.com/r-rishabh-j/distillSpec))
+- KV-Caching with pruning in rejection sampling
 
 
 ## What is Speculative Decoding?
