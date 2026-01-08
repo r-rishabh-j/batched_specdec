@@ -2,13 +2,14 @@ import gc
 import torch
 from torch.nn import Module
 from .logits_processor import LogitsProcessor, GreedyProcessor
-from . import printing
+from .cache_manager import CacheManager
 from typing import List, Tuple
 from torch.nn import functional as F
 from rich.panel import Panel
 from rich.live import Live
 from rich.text import Text
 from rich.console import Console, Group
+from transformers import DynamicCache
 
 def prune_cache(cache, cache_len):
     if cache is None:
@@ -27,6 +28,28 @@ def prob_norm(x: torch.Tensor) -> torch.Tensor:
     x_max_sum = torch.sum(x_max, dim=-1, keepdim=True)
     return x_max / x_max_sum
 
+def evict_from_cache(cache, keep_mask):
+    """Evict batch elements from cache where keep_mask is False. Modifies in place and returns cache."""
+    if cache is None:
+        return None
+    
+    # Early exit if nothing to evict
+    if keep_mask.all():
+        return cache
+    
+    # Old API: direct access to key_cache/value_cache lists (modify in place)
+    if hasattr(cache, 'key_cache') and cache.key_cache:
+        for layer_idx in range(len(cache.key_cache)):
+            cache.key_cache[layer_idx] = cache.key_cache[layer_idx][keep_mask]
+            cache.value_cache[layer_idx] = cache.value_cache[layer_idx][keep_mask]
+        return cache
+    
+    # New API: use iterator and update() - must create new cache since update() appends
+    new_cache = DynamicCache()
+    for layer_idx, (k, v) in enumerate(cache):
+        new_cache.update(k[keep_mask], v[keep_mask], layer_idx)
+    return new_cache
+
 @torch.no_grad()
 def speculative_generate_batch(
     batch_inputs: List[List[int]],
@@ -40,6 +63,7 @@ def speculative_generate_batch(
     pad_token_id: int = 0,
     skip_sample_adjustment: bool = False,
     collect_stats: bool = False,
+    use_cache: bool = True,
     debug: bool = True ):
     """
     Batched speculative decoding for variable-length prompts.
@@ -50,7 +74,8 @@ def speculative_generate_batch(
     vocab_size = int(target.config.vocab_size)
     B = len(batch_inputs)
     batch_indexer = torch.arange(B)
-
+    
+    # configure lengths
     max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') \
         else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
     prompt_lens = torch.tensor([len(prompt) for prompt in batch_inputs], device=device)
@@ -63,6 +88,7 @@ def speculative_generate_batch(
     for b, prompt in enumerate(batch_inputs):
         input_ids[b, :len(prompt)] = torch.tensor(prompt, dtype=torch.long, device=device)
 
+    # performance counters
     drafts_accepted = torch.zeros(B, device=device)
     drafts_speculated = torch.zeros(B, device=device)
 
@@ -74,22 +100,34 @@ def speculative_generate_batch(
         max_prompt_len = int(start_positions.max().item())
         positions = torch.arange(max_prompt_len + margin, device=device).unsqueeze(0)
         mask = (positions < start_positions.unsqueeze(1)).to(dtype=torch.int).contiguous()
-        return mask.shape[1], mask
+        return max_prompt_len, mask
 
+    cache_manager = CacheManager(use_cache)
+    
     # generate the first token from target
     max_prompt_len, attn_mask = attention_mask(start_positions)
-    target_logits = target(
+    target_output = target(
         input_ids = input_ids[:, :max_prompt_len],
         attention_mask = attn_mask,
-        use_cache=False
-    ).logits
-    # get new token from end of output Mp and put in input_ids
+        use_cache=use_cache
+    )
+    target_logits = target_output.logits
+    cache_manager.load_target_cache(target_output.past_key_values)
+    # prefill draft model
+    draft_output = drafter(
+        input_ids = input_ids[:, :max_prompt_len],
+        attention_mask = attn_mask,
+        use_cache=use_cache,
+    )
+    cache_manager.load_draft_cache(draft_output.past_key_values)
+    # get new token from end of target output and place in input_ids
     new_tok_probs = logits_processor(target_logits[batch_indexer, start_positions-1])
     # sample from target distribution
     new_token_batch = logits_processor.sample(new_tok_probs)
     input_ids[batch_indexer, start_positions]=new_token_batch
     # move pointers one step ahead
     start_positions += 1
+    cache_manager.prune_cache_to_min(start_positions)
 
     if debug:
         console = Console()
@@ -104,6 +142,9 @@ def speculative_generate_batch(
     # or that eos token has been reached
     active_status = start_positions < max_total_length
     active_status &= (new_token_batch != eos_tokens_id)
+    
+    # Evict any sequences that finished on first token from cache
+    cache_manager.evict_inactive(active_status)
 
     # buffers to store prob outputs from draft and target, redundant +1 for batching
     Q = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target.dtype) # draft
@@ -111,7 +152,7 @@ def speculative_generate_batch(
     # run loop untill all sequences terminated
     while torch.any(active_status) and int(start_positions.max().item()) < max_total_length:
         # process only those sequences which are active
-        active_indices = active_status.nonzero().squeeze(-1)
+        active_indices = active_status.nonzero().flatten()  # Use flatten() to avoid scalar when B=1
         num_active = len(active_indices)
         active_indexer = torch.arange(num_active)
         max_current = start_positions[active_indices].max().item()
@@ -127,41 +168,43 @@ def speculative_generate_batch(
         # attn mask for autoregressive drafting
         # mask and len updated in loop
         max_length, attn_mask = attention_mask(next_indices, margin=draft_steps)
+        draft_cache_len=cache_manager.get_draft_len()
         for k in range(draft_steps):
             draft_output = drafter(
-                input_ids=input_ids[active_indices, :max_length],
+                input_ids=input_ids[active_indices, draft_cache_len:max_length],
                 attention_mask=attn_mask[:, :max_length],
-                use_cache=False
+                use_cache=use_cache,
+                past_key_values=cache_manager.draft_cache
             )
+            
             draft_logits = draft_output.logits
-            del draft_output  # Free model output container
-            # get the last logit batch from model output
-            Q[active_indices, k] = logits_processor(draft_logits[active_indexer, next_indices-1]) # -1 for left shift
-            del draft_logits  # Free logits after use
-            # sample from this batch of next tokens
+            Q[active_indices, k] = logits_processor(draft_logits[active_indexer, next_indices-draft_cache_len-1])
+            
             new_token_batch = logits_processor.sample(Q[active_indices, k])
-            # ignore tokens for inactive drafts
             new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
-            # make those drafts inactive which have eos
             draft_active &= (new_token_batch != eos_tokens_id)
-            # write to input IDs
-            input_ids[active_indices, next_indices]=new_token_batch
-            draft_lengths+=draft_active
-            # update mask and lengths to accomodate generated tokens in next loop
-            attn_mask[active_indexer, next_indices]=True
-            next_indices+=1
-            max_length+=1
+            input_ids[active_indices, next_indices] = new_token_batch
+            draft_lengths += draft_active
+            attn_mask[:, next_indices] = 1
+            next_indices += 1
+            max_length += 1
+            draft_cache_len += 1
+            cache_manager.crop(draft_cache_len, which='draft')
 
+        cache_manager.load_draft_cache(draft_output.past_key_values)
         drafts_speculated[active_indices] += draft_lengths
 
         # parallel verification of drafted tokens
+        target_cache_len = cache_manager.get_target_len()
         target_output = target(
-            input_ids=input_ids[active_indices, :max_length],
+            input_ids=input_ids[active_indices, target_cache_len:max_length],
             attention_mask=attn_mask,
-            use_cache=False
+            use_cache=use_cache,
+            past_key_values=cache_manager.target_cache
         )
         target_logits = target_output.logits
-        del target_output, attn_mask  # Free model output container immediately
+        cache_manager.load_target_cache(target_output.past_key_values)
+        del target_output, attn_mask  # Free model output container
         # eps for avoiding NaN
         eps = 1e-12
 
@@ -170,8 +213,8 @@ def speculative_generate_batch(
         draft_indexer = torch.arange(draft_steps+1, device=device)
         drafted_indices=start_positions[active_indices].unsqueeze(1) + draft_indexer # [num_active, draft_steps+1]
         drafted_tokens=input_ids[active_indices.unsqueeze(1), drafted_indices[:,:-1]] # [num_active, draft_steps]
-        # -1 for left shift of model probs
-        p = logits_processor(target_logits[active_indexer.unsqueeze(1), drafted_indices-1]).clamp(min=eps) # [num_active, draft_steps+1, vocab_size]
+        # -1 for left shift of model probs, use target_cache_len for offset
+        p = logits_processor(target_logits[active_indexer.unsqueeze(1), drafted_indices-target_cache_len-1]).clamp(min=eps) # [num_active, draft_steps+1, vocab_size]
         p_tok = p[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1) # [num_active, draft_steps]
         q_tok = q[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1) # [num_active, draft_steps]
         del target_logits
@@ -218,6 +261,7 @@ def speculative_generate_batch(
             num_accepted
         )
         drafts_accepted[active_indices]+=accepted_draft_length
+
         if debug:
             active_idx = 0
             for b in range(B):
@@ -228,6 +272,15 @@ def speculative_generate_batch(
             live.refresh()
 
         start_positions[active_indices]+=accepted_draft_length+1 # includes extra/bonus token
+        
+        # Evict newly inactive sequences from cache
+        # active_status[active_indices] gives which of the current batch elements are still active
+        keep_mask = active_status[active_indices]
+        cache_manager.evict_inactive(keep_mask)
+        # Prune cache sequence length to minimum across remaining active sequences
+        new_active_indices = active_status.nonzero().flatten()
+        if len(new_active_indices) > 0:
+            cache_manager.prune_cache_to_min(start_positions[new_active_indices])
         
     if debug:
         live.stop()
@@ -246,174 +299,3 @@ def speculative_generate_batch(
     del input_ids, Q, drafts_accepted, drafts_speculated, prompt_lens, start_positions, batch_indexer, active_status
     
     return outputs, acc_rates, []
-
-
-@torch.no_grad()
-def speculative_generate(
-    inputs: List[int],
-    drafter: Module,
-    target: Module,
-    tokenizer = None,
-    gamma: int = 5,
-    logits_processor: LogitsProcessor = GreedyProcessor(),
-    max_gen_len: int = 40,
-    eos_tokens_id: int | List[int] = 1,
-    pad_token_id: int = 0,
-    use_cache: bool = False,
-    skip_sample_adjustment: bool = True,
-    first_target: bool = True,
-    debug: bool = False,
-) -> Tuple[List[int], float]:
-    """
-    Generate text sequence using the speculative decoding algorithm.
-    Implementation of Speculative Decoding. (https://arxiv.org/pdf/2211.17192.pdf)
-    
-    Args:
-        inputs (List[int]): input sequence of batch size 1.
-        drafter (Module): drafter model.
-        target (Module): target model.
-        tokenizer: tokenizer (used for debugging).
-        gamma (int): number of drafts generated by the drafter at each step.
-        logits_processor (LogitsProcessor): logits processor for sampling.
-        max_gen_len (int): maximum length of the generated sequence.
-        eos_tokens_id (int or List[int]): end token id (could be multiple).
-        pad_token_id (int): pad token id.
-        use_cache (bool): whether to use cache.
-        skip_sample_adjustment (bool): whether to skip the sample adjustment step when some drafts are discarded.
-        first_target (bool): whether to run the target model before the speculative algorithm.
-        debug (bool): debug mode.
-    
-    Returns:
-        List[int]: generated sequence.
-        float: acceptance rate (number of accepted drafts divided by the number of total drafts).
-        
-    Note: This generation methods only works for decoder-only models.
-    Note bis: The drafter and target models should output the same logits shape.
-    Note ter: NgramModels are currently not supported.
-    """
-    
-    drafter_cache, target_cache = None, None
-
-    list_tokens_id = eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id]
-    stop_tokens = torch.tensor(list_tokens_id, dtype=torch.long, device=target.device).unsqueeze(1)
-    
-    drafts_accepted, drafts_speculated = .0, .0
-    
-    vocab_size = target.config.vocab_size    
-        
-    # prepare input tensor
-    prompt_len = len(inputs)
-    max_seq_length = target.config.max_position_embeddings if hasattr(target.config, 'max_position_embeddings') else (target.config.max_context_length if hasattr(target.config, 'max_context_length') else 1024)
-    total_len = min(max_seq_length, prompt_len + max_gen_len)
-    input_ids = torch.full((1, total_len), pad_token_id, dtype=torch.long, device=target.device)
-    input_ids[0, :prompt_len] = torch.tensor(inputs, dtype=torch.long, device=target.device)
-    
-    current_position = prompt_len
-    
-    if first_target:
-        # run the target model before the speculative algorithm. Allows to prefill the kvcache and get a first token.
-        Mp = target(
-            input_ids=input_ids[..., :current_position],
-            past_key_values=target_cache,
-            use_cache=use_cache,
-        )
-        target_cache = Mp.past_key_values
-        p_p = logits_processor(Mp.logits[..., -1, :])
-        t = logits_processor.sample(p_p)
-        input_ids[0, current_position] = t
-        current_position += 1
-        
-        if torch.isin(t, stop_tokens):
-            if debug:
-                printing.end_token_found(0)
-            return input_ids[0, prompt_len:current_position].tolist(), 0
-        
-        if debug:
-            printing.initial_step(t, tokenizer)
-
-
-    while current_position < total_len:
-        corrected_gamma = min(gamma, total_len - current_position - 1)
-        q = torch.zeros((1, corrected_gamma, vocab_size), device=target.device)
-        
-        input_ids = input_ids.to(drafter.device)
-        
-        # generate gamma drafts
-        for k in range(corrected_gamma):
-            Mq = drafter(
-                input_ids=input_ids[..., :current_position + k],
-                past_key_values=drafter_cache,
-                use_cache=use_cache,
-            )
-            drafter_cache = Mq.past_key_values
-            
-            draft_logits = Mq.logits[..., -1, :]
-            draft_probs = logits_processor(draft_logits)
-            q[0, k] = draft_probs.to(target.device)
-            xi = logits_processor.sample(draft_probs)
-            input_ids[0, current_position + k] = xi
-        drafts_speculated += corrected_gamma
-        input_ids = input_ids.to(target.device)
-        
-        # run target model on drafts and get logits of the previous tokens plus one more token
-        Mp = target(
-            input_ids=input_ids[..., :current_position + corrected_gamma],
-            past_key_values=target_cache,
-            use_cache=use_cache,
-        )
-        target_cache = Mp.past_key_values
-        draft_logits = Mp.logits[..., current_position - 1:current_position + corrected_gamma - 1, :] # [1, corrected_gamma, vocab_size]
-        p = logits_processor(draft_logits) # [1, gamma, vocab_size]
-        
-        # compute the last accepted draft position (rejection sampling)
-        r = torch.rand(corrected_gamma, device=target.device)
-        fractions = p / q
-        n = corrected_gamma
-        for i in range(corrected_gamma):
-            if r[i] > fractions[0, i, input_ids[0, current_position + i]]:
-                n = i
-                break
-        
-        drafts_accepted += n
-        
-        # check if the end token is in the drafts
-        stop_locations = torch.nonzero(torch.eq(input_ids[..., current_position:current_position + n], stop_tokens))
-        if stop_locations.shape[0] > 0:
-            stop_location = stop_locations[0, 1].item()
-            if debug:
-                printing.end_token_found(stop_location)
-            return input_ids[0, prompt_len:current_position + stop_location + 1].tolist(), drafts_accepted / drafts_speculated
-
-        # adjust the distribution from Mp
-        if n == corrected_gamma:
-            p_p = Mp.logits[..., current_position + corrected_gamma - 1, :]
-            p_p = logits_processor(p_p)
-        else:
-            # prune the cache
-            if use_cache:
-                drafter_cache = prune_cache(drafter_cache, current_position + n)
-                target_cache = prune_cache(target_cache, current_position + n +1)
-
-            if not skip_sample_adjustment:
-                p_p = prob_norm(p[..., n, :] - q[0, n, :])
-            else:
-                p_p = p[..., n, :]
-        x = logits_processor.sample(p_p)
-        
-        if debug:
-            generated = input_ids.clone().detach()
-            
-        input_ids[0, current_position + n:current_position + corrected_gamma] = pad_token_id
-        input_ids[0, current_position + n] = x
-        
-        if debug:
-            printing.speculative_step(tokenizer, generated, input_ids, n, prompt_len, current_position, corrected_gamma)
-            
-        current_position += n + 1
-        
-        if torch.isin(x, stop_tokens):
-            if debug:
-                printing.end_token_found(n)
-            return input_ids[0, prompt_len:current_position].tolist(), drafts_accepted / drafts_speculated
-    
-    return input_ids[0, prompt_len:].tolist(), drafts_accepted / drafts_speculated

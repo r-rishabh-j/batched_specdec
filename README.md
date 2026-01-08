@@ -50,7 +50,7 @@ bitsandbytes
 
 ### 1. Generate text
 
-Run the provided sample script `main.py`, or follow the instructions below:
+From parent directory, run `python -m batched_specdec.main [--config file_path]`, or follow the instructions below:
 
 #### a. Load the target and drafter model
 

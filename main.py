@@ -1,15 +1,15 @@
 import os
 import torch
-from datasets import load_dataset
-import numpy as np
 import gc
 import tqdm
 import json
 import pickle
+import numpy as np
 from transformers import set_seed
-from batched_specdec import speculative_generate_batch
-from batched_specdec.logits_processor import NucleusProcessor, GreedyProcessor
+from . import speculative_generate_batch
+from . import NucleusProcessor, GreedyProcessor
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from datasets import load_dataset
 import argparse
 
 SEED = 42
@@ -95,7 +95,7 @@ def evaluate_generation(draft_model, prompts, max_new_tokens, output_file=None):
     speculative_results = []
     alphas = []
     outputs = []
-    batch_size = config.get('batch_size', 3)
+    batch_size = config.get('batch_size')
 
     for start_idx in tqdm.tqdm(range(0, len(prompts), batch_size), total=(len(prompts)+batch_size-1)//batch_size):
         end_idx = min(start_idx + batch_size, len(prompts))
