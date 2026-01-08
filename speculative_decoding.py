@@ -28,7 +28,6 @@ def speculative_generate_batch(
     debug: bool = True ):
     """
     Batched speculative decoding for variable-length prompts.
-    This implementation ignores kv caching and instead relies on attention masks.
     Returns generated sequences, per-sample acceptance rates, and optional stats.
     """
     device = target.device
