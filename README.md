@@ -1,13 +1,13 @@
 # Batched Speculative Decoding
 
 This repository is a PyTorch implementation of Speculative Decoding / Speculative Sampling ([Leviathan et al., 2023](#1); [Chen et al., 2023](#2)).
-It contains the code for three generation strategies: classic auto-regressive decoding, speculative decoding with draft and batched speculative decoding.
 
-We support speculative decoding with
+We support:
 
 - Prompt batching
 - Non-uniform acceptance lengths
 - Parallel verification of drafts enabling scalable evaluation of model alignment approaches (refer [distillSpec](https://github.com/r-rishabh-j/distillSpec))
+- KV-Caching with pruning in rejection sampling
 
 
 ## What is Speculative Decoding?
