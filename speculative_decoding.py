@@ -11,45 +11,6 @@ from rich.text import Text
 from rich.console import Console, Group
 from transformers import DynamicCache
 
-def prune_cache(cache, cache_len):
-    if cache is None:
-        return None
-    cache.crop(cache_len)
-    return cache
-
-def prob_norm(x: torch.Tensor) -> torch.Tensor:
-    """
-    Max function.
-        x: input tensor.
-    Returns:
-        tensor norm(max(0, x)).
-    """
-    x_max = torch.where(x > 0, x, torch.zeros_like(x))
-    x_max_sum = torch.sum(x_max, dim=-1, keepdim=True)
-    return x_max / x_max_sum
-
-def evict_from_cache(cache, keep_mask):
-    """Evict batch elements from cache where keep_mask is False. Modifies in place and returns cache."""
-    if cache is None:
-        return None
-    
-    # Early exit if nothing to evict
-    if keep_mask.all():
-        return cache
-    
-    # Old API: direct access to key_cache/value_cache lists (modify in place)
-    if hasattr(cache, 'key_cache') and cache.key_cache:
-        for layer_idx in range(len(cache.key_cache)):
-            cache.key_cache[layer_idx] = cache.key_cache[layer_idx][keep_mask]
-            cache.value_cache[layer_idx] = cache.value_cache[layer_idx][keep_mask]
-        return cache
-    
-    # New API: use iterator and update() - must create new cache since update() appends
-    new_cache = DynamicCache()
-    for layer_idx, (k, v) in enumerate(cache):
-        new_cache.update(k[keep_mask], v[keep_mask], layer_idx)
-    return new_cache
-
 @torch.no_grad()
 def speculative_generate_batch(
     batch_inputs: List[List[int]],
@@ -164,12 +125,14 @@ def speculative_generate_batch(
         # use drafter to generate draft_steps tokens
         draft_active = torch.full((num_active,), True, device=device)
         draft_lengths = torch.full_like(active_indices, 0, device=device)
+
+        # next positions to be filled in drafting
         next_indices = start_positions[active_indices].clone()
-        # attn mask for autoregressive drafting
-        # mask and len updated in loop
+        # attn mask for autoregressive drafting. mask and len updated in loop
         max_length, attn_mask = attention_mask(next_indices, margin=draft_steps)
         draft_cache_len=cache_manager.get_draft_len()
         for k in range(draft_steps):
+            # draft a token
             draft_output = drafter(
                 input_ids=input_ids[active_indices, draft_cache_len:max_length],
                 attention_mask=attn_mask[:, :max_length],
@@ -177,21 +140,29 @@ def speculative_generate_batch(
                 past_key_values=cache_manager.draft_cache
             )
             
+            # get and process logits
             draft_logits = draft_output.logits
             Q[active_indices, k] = logits_processor(draft_logits[active_indexer, next_indices-draft_cache_len-1])
             
+            # sample tokens
             new_token_batch = logits_processor.sample(Q[active_indices, k])
             new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+
+            # find eos token and mark inactive
             draft_active &= (new_token_batch != eos_tokens_id)
             input_ids[active_indices, next_indices] = new_token_batch
             draft_lengths += draft_active
+
+            # update attention mask to include new token
             attn_mask[:, next_indices] = 1
+
+            # update lengths
             next_indices += 1
             max_length += 1
+            # need to crop cache to seq with smallest length to avoid accessing invalid positions
             draft_cache_len += 1
             cache_manager.crop(draft_cache_len, which='draft')
 
-        cache_manager.load_draft_cache(draft_output.past_key_values)
         drafts_speculated[active_indices] += draft_lengths
 
         # parallel verification of drafted tokens
@@ -203,11 +174,11 @@ def speculative_generate_batch(
             past_key_values=cache_manager.target_cache
         )
         target_logits = target_output.logits
-        cache_manager.load_target_cache(target_output.past_key_values)
         del target_output, attn_mask  # Free model output container
         # eps for avoiding NaN
         eps = 1e-12
 
+        # gather target probs for drafted tokens
         q = Q[active_indices, :draft_steps+1].clamp(min=eps) # [num_active, draft_steps+1, vocab_size]
         # create an index array to gather draft probs and tokens. Include an extra position for bonus token
         draft_indexer = torch.arange(draft_steps+1, device=device)
@@ -218,8 +189,11 @@ def speculative_generate_batch(
         p_tok = p[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1) # [num_active, draft_steps]
         q_tok = q[:, :draft_steps].gather(dim=2, index=drafted_tokens.unsqueeze(-1)).squeeze(-1) # [num_active, draft_steps]
         del target_logits
+
+        # compute log ratios for rejection sampling
         log_ratio = torch.log(p_tok) - torch.log(q_tok)
         log_r = torch.log(torch.rand(log_ratio.shape, device=device))
+
         # Find first rejection (vectorized cumulative product)
         # take cumsum of accepted_mask, the first false breaks the chain
         acceptance_status = (log_r<=log_ratio).cumprod(dim=1).to(dtype=bool)  # [num_active, draft_steps]
