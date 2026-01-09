@@ -1,0 +1,8 @@
+rich
+tqdm
+termcolor
+tokenizers
+torch
+transformers
+accelerate
+datasets
