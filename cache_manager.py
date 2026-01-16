@@ -69,8 +69,8 @@ class CacheManager:
         return new_cache
     
     def prune_cache_to_min(self,  start_positions):
-        """ prune cache to smallest input sequence """
-        if not self.use_cache or not len(start_positions):
+        """ prune cache to smallest input sequence (draft cache only, target syncs separately) """
+        if not self.use_cache or start_positions.numel() == 0:
             return
         min_seq_len = int(start_positions.min().item()) - 1
         self.target_cache.crop(min_seq_len)

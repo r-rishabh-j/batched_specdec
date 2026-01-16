@@ -1,4 +1,3 @@
-import gc
 import time
 import torch
 from torch.nn import Module
@@ -87,6 +86,7 @@ def speculative_generate_batch(
     attn_mask[batch_indexer, start_positions]=1
     # move pointers one step ahead
     start_positions += 1
+    # Crop both caches to min position after first token
     cache_manager.prune_cache_to_min(start_positions)
 
     # Token speed tracking (always enabled)
@@ -133,11 +133,12 @@ def speculative_generate_batch(
         draft_lengths = torch.full_like(active_indices, 0, device=device)
 
         # next positions to be filled in drafting
-        draft_cache_len=cache_manager.get_draft_len()
+        # draft cache is cropped to minimum seq length
+        min_seq_len=cache_manager.get_draft_len()
         for k in range(draft_steps):
             # draft a token
             draft_output = draft_model(
-                input_ids=input_ids[active_indices, draft_cache_len+k:max_length+k],
+                input_ids=input_ids[active_indices, min_seq_len+k:max_length+k],
                 attention_mask=attn_mask[active_indices, :max_length+k],
                 use_cache=use_cache,
                 past_key_values=cache_manager.draft_cache
@@ -145,7 +146,7 @@ def speculative_generate_batch(
             
             # get and process logits
             draft_logits = draft_output.logits
-            Q[active_indices, k] = logits_processor(draft_logits[active_indexer, active_start_positions-draft_cache_len-1])
+            Q[active_indices, k] = logits_processor(draft_logits[active_indexer, active_start_positions-min_seq_len-1])
             
             # sample tokens
             new_token_batch = logits_processor.sample(Q[active_indices, k])
@@ -159,7 +160,7 @@ def speculative_generate_batch(
             draft_lengths += draft_active
 
             # need to crop cache to seq with smallest length to avoid accessing invalid positions
-            cache_manager.crop(draft_cache_len+k, which='draft')
+            cache_manager.crop(min_seq_len+k+1, which='draft')
 
         drafts_speculated[active_indices] += draft_lengths
 
@@ -262,8 +263,9 @@ def speculative_generate_batch(
         cache_manager.evict_inactive(keep_mask)
         # Prune cache sequence length to minimum across remaining active sequences
         new_active_indices = active_status.nonzero().flatten()
-        if len(new_active_indices) > 0:
-            cache_manager.prune_cache_to_min(start_positions[new_active_indices])
+        if new_active_indices.numel() > 0:
+            new_start_positions = start_positions[new_active_indices].view(-1)
+            cache_manager.prune_cache_to_min(new_start_positions)
         
     # Print final tokens/s
     elapsed = time.perf_counter() - start_time
