@@ -239,6 +239,7 @@ def speculative_generate_batch(
             num_accepted
         )
         drafts_accepted[active_indices]+=accepted_draft_length
+        num_blocks[active_indices] += 1
 
         # Update tokens count: accepted_draft_length + 1 (bonus token) for each active sequence
         tokens_this_iter = int((accepted_draft_length + 1).sum().item())
@@ -267,10 +268,12 @@ def speculative_generate_batch(
             new_start_positions = start_positions[new_active_indices].view(-1)
             cache_manager.prune_cache_to_min(new_start_positions)
         
-    # Print final tokens/s
+    # Print final tokens/s and block efficiency
     elapsed = time.perf_counter() - start_time
     tps = total_tokens / elapsed if elapsed > 0 else 0
-    print(f"\nGeneration complete: {total_tokens} tokens in {elapsed:.2f}s ({tps:.2f} tokens/s)", flush=True)
+    total_blocks = int(num_blocks.sum().item())
+    block_efficiency = total_tokens / total_blocks if total_blocks > 0 else 0
+    print(f"\nGeneration complete: {total_tokens} tokens in {elapsed:.2f}s ({tps:.2f} tokens/s) | Block efficiency: {block_efficiency:.2f} tokens/block", flush=True)
 
     if debug:
         live.stop()
