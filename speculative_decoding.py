@@ -35,6 +35,8 @@ def speculative_generate_batch(
     batch_indexer = torch.arange(B, device=device)
     
     # configure lengths
+    list_eos_tokens_id = eos_tokens_id if isinstance(eos_tokens_id, list) else [eos_tokens_id]
+    eos_tokens_tensor = torch.tensor(list_eos_tokens_id, dtype=torch.long, device=device)
     max_seq_length = target_model.config.max_position_embeddings if hasattr(target_model.config, 'max_position_embeddings') \
         else (target_model.config.max_context_length if hasattr(target_model.config, 'max_context_length') else 1024)
     prompt_lens = torch.tensor([len(prompt) for prompt in prompts], device=device)
@@ -105,7 +107,7 @@ def speculative_generate_batch(
     # store which prompts are now terminated, either by exceeding max len 
     # or that eos token has been reached
     active_status = start_positions < max_total_length
-    active_status &= (new_token_batch != eos_tokens_id)
+    active_status &= ~torch.isin(new_token_batch, eos_tokens_tensor)
     
     # Evict any sequences that finished on first token from cache
     cache_manager.evict_inactive(active_status)
@@ -150,10 +152,14 @@ def speculative_generate_batch(
             
             # sample tokens
             new_token_batch = logits_processor.sample(Q[active_indices, k])
-            new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+            new_token_batch = torch.where(
+                draft_active,
+                new_token_batch,
+                eos_tokens_tensor[0].expand_as(new_token_batch),
+            )
 
             # find eos token and mark inactive
-            draft_active &= (new_token_batch != eos_tokens_id)
+            draft_active &= ~torch.isin(new_token_batch, eos_tokens_tensor)
             input_ids[active_indices, active_start_positions+k] = new_token_batch
             # update attention mask to include new token
             attn_mask[active_indices, active_start_positions+k] = 1
@@ -176,7 +182,7 @@ def speculative_generate_batch(
         del target_model_output  # Free model output container
 
         # eps for avoiding NaN
-        eps = 1e-12
+        eps = 1e-10
 
         # gather target_model probs for drafted tokens
         q = Q[active_indices, :draft_steps+1].clamp(min=eps) # [num_active, draft_steps+1, vocab_size]
@@ -223,7 +229,7 @@ def speculative_generate_batch(
         # find eos token and update active status, start positions
         drafted_tokens = input_ids[active_indices.unsqueeze(1), drafted_indices] # includes bonus token
         # Simple eos check without torch.isin
-        eos_hits = (drafted_tokens == eos_tokens_id)
+        eos_hits = torch.isin(drafted_tokens, eos_tokens_tensor)
         eos_positions = torch.where(
             eos_hits,
             draft_indexer,
