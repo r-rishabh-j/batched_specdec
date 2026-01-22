@@ -48,7 +48,8 @@ def autoregressive_generate(
     )
     stop_tokens = torch.tensor(list_tokens_id, dtype=torch.long, device=model.device)
 
-    curr = prompt_len
+    if prompt_len >= total_len:
+        return []
     for curr in range(prompt_len, total_len):
         if use_cache:
             o = model(input_ids[..., curr-1:curr], past_key_values=cache, use_cache=use_cache)
