@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 import argparse
 
-SEED = 44
+SEED = 42
 set_seed(SEED)
 
 # load config from args. if none, default to file
@@ -29,8 +29,8 @@ if args.config is not None:
 else:
     config = {
         'dir': './results/baseline/',
-        'num_prompts': 100,
-        'gen_len': 100,
+        'num_prompts': 1000,
+        'gen_len': 200,
         'logits_processor': {
             'type': 'NucleusProcessor',
             'temperature': 0.6,
@@ -40,7 +40,7 @@ else:
         'models': {
             'target': 'Qwen/Qwen3-4B-Instruct-2507',
         },
-        'batch_size': 2,
+        'batch_size': 16,
         'show_output': True,
     }
 

@@ -12,7 +12,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 import argparse
 
-SEED = 4200
+SEED = 42
 set_seed(SEED)
 
 # load config from args. if none, default to file
@@ -26,7 +26,7 @@ else:
     config = {
         'dir': './results/gsm-qwen-1000/',
         'num_prompts': 1000,
-        'gen_len': 100,
+        'gen_len': 200,
         'gamma': 5,
         'logits_processor': {
             'type': 'NucleusProcessor',
@@ -40,7 +40,7 @@ else:
                 'base': 'Qwen/Qwen3-0.6B',
             }
         },
-        'batch_size': 40,
+        'batch_size': 16,
         'show_output': True,
     }
 
@@ -66,6 +66,7 @@ dataset=dataset.select(list(range(NUM_PROMPTS)))
 target=config['models']['target']
 tokenizer = AutoTokenizer.from_pretrained(target)
 tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = 'left'
 
 def map_to_prompts(example):
     if config.get('dataset_name') == 'openai/gsm8k':
@@ -101,9 +102,8 @@ def evaluate_generation(draft_model, prompts, max_new_tokens, output_file=None):
         end_idx = min(start_idx + batch_size, len(prompts))
         batch_prompts = prompts[start_idx:end_idx]['prompt']
         print(f"Evaluating prompts {start_idx} to {end_idx-1}...")
-        # tokenizer.padding_side = 'left'
         tokenized = tokenizer(batch_prompts, padding='longest', return_tensors='pt')
-        output_ids_sd, alpha, stats = speculative_generate_batch_v2(
+        output_ids_sd, alpha, stats = speculative_generate_batch_v3(
                 tokenized.input_ids,
                 tokenized.attention_mask,
                 draft_model,
@@ -111,12 +111,12 @@ def evaluate_generation(draft_model, prompts, max_new_tokens, output_file=None):
                 logits_processor=logits_processor,
                 gamma=gamma,
                 max_gen_len=max_new_tokens,
-                eos_tokens_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
                 # collect_stats=True, 
                 tokenizer=tokenizer,
                 debug=config.get('show_output', True),
-                # use_cache=False,
+                use_cache=False,
             )
         print("Acceptance rate:", np.mean(alpha))
         speculative_results.extend(stats)

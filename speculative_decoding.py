@@ -20,7 +20,7 @@ def speculative_generate_batch(
     gamma: int = 5,
     logits_processor: LogitsProcessor = GreedyProcessor(),
     max_gen_len: int = 40,
-    eos_tokens_id: int | List[int] = 1,
+    eos_token_id: int | List[int] = 1,
     pad_token_id: int = 0,
     skip_sample_adjustment: bool = False,
     collect_stats: bool = False,
@@ -108,7 +108,7 @@ def speculative_generate_batch(
     # store which prompts are now terminated, either by exceeding max len 
     # or that eos token has been reached
     active_status = start_positions < max_total_length
-    active_status &= (new_token_batch != eos_tokens_id)
+    active_status &= (new_token_batch != eos_token_id)
     
     # Evict any sequences that finished on first token from cache
     cache_manager.evict_inactive(active_status)
@@ -155,14 +155,14 @@ def speculative_generate_batch(
             
             # sample tokens
             new_token_batch = logits_processor.sample(Q[active_indices, k])
-            new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+            new_token_batch = torch.where(draft_active, new_token_batch, eos_token_id)
 
             # find eos token and mark inactive
             input_ids[active_indices, active_start_positions+k] = new_token_batch
             # update attention mask to include new token
             attn_mask[active_indices, active_start_positions+k] = 1
             draft_lengths += draft_active
-            draft_active &= (new_token_batch != eos_tokens_id)
+            draft_active &= (new_token_batch != eos_token_id)
 
             # need to crop cache to seq with smallest length to avoid accessing invalid positions
             cache_manager.crop(min_seq_len+k+1, which='draft')
@@ -229,7 +229,7 @@ def speculative_generate_batch(
         # find eos token and update active status, start positions
         drafted_tokens = input_ids[active_indices.unsqueeze(1), drafted_indices] # includes bonus token
         # Simple eos check without torch.isin
-        eos_hits = (drafted_tokens == eos_tokens_id)
+        eos_hits = (drafted_tokens == eos_token_id)
         eos_positions = torch.where(
             eos_hits,
             draft_indexer,
@@ -309,7 +309,7 @@ def speculative_generate_batch_v2(
     gamma: int = 5,
     logits_processor: LogitsProcessor = GreedyProcessor(),
     max_gen_len: int = 40,
-    eos_tokens_id: int | List[int] = 1,
+    eos_token_id: int | List[int] = 1,
     pad_token_id: int = 0,
     skip_sample_adjustment: bool = False,
     collect_stats: bool = False,
@@ -408,7 +408,7 @@ def speculative_generate_batch_v2(
         live.start()
 
     active_status = torch.full((B, ), True, dtype=torch.bool, device=device)
-    active_status &= (new_token_batch != eos_tokens_id)
+    active_status &= (new_token_batch != eos_token_id)
 
     # buffers to store prob outputs from draft model, redundant +1 for batched resample
     Q = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target_model.dtype) # draft
@@ -461,14 +461,14 @@ def speculative_generate_batch_v2(
 
             # sample tokens
             new_token_batch = logits_processor.sample(Q[active_indices, k])
-            new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+            new_token_batch = torch.where(draft_active, new_token_batch, eos_token_id)
 
             # find eos token and mark inactive
             input_ids[active_indices, batch_position+k] = new_token_batch
             # update attention mask to include new token
             attn_mask[active_indices, batch_position+k] = 1
             draft_lengths += draft_active
-            draft_active &= (new_token_batch != eos_tokens_id)
+            draft_active &= (new_token_batch != eos_token_id)
 
         drafts_speculated[active_indices] += draft_lengths
 
@@ -532,7 +532,7 @@ def speculative_generate_batch_v2(
         # find eos token and update active status, start positions
         drafted_tokens=input_ids[active_indices, batch_position:batch_position+draft_steps]
         eos_positions = torch.where(
-            drafted_tokens == eos_tokens_id,
+            drafted_tokens == eos_token_id,
             torch.arange(draft_steps, device=device),
             max_seq_length
         ).min(dim=1).values
@@ -544,7 +544,7 @@ def speculative_generate_batch_v2(
             num_accepted
         )
         # update active sequences
-        active_status[active_indices] &= ~( has_eos | (extra_tokens == eos_tokens_id) )
+        active_status[active_indices] &= ~( has_eos | (extra_tokens == eos_token_id) )
         drafts_accepted[active_indices] += accepted_draft_length
         num_blocks[active_indices] += 1
 
@@ -603,7 +603,7 @@ def speculative_generate_batch_v3(
     gamma: int = 5,
     logits_processor: LogitsProcessor = GreedyProcessor(),
     max_gen_len: int = 40,
-    eos_tokens_id: int | List[int] = 1,
+    eos_token_id: int | List[int] = 1,
     pad_token_id: int = 0,
     skip_sample_adjustment: bool = False,
     collect_stats: bool = False,
@@ -636,8 +636,8 @@ def speculative_generate_batch_v3(
     num_blocks = torch.zeros(B, device=device)
 
     # Use DynamicCache instead of StaticCache
-    target_cache = DynamicCache()
-    draft_cache = DynamicCache()
+    target_cache = DynamicCache() if use_cache else None
+    draft_cache = DynamicCache() if use_cache else None
 
     # PREFILL
     mask = attn_mask[:, :batch_position]
@@ -650,7 +650,8 @@ def speculative_generate_batch_v3(
         use_cache = use_cache,
     )
     target_model_logits = target_model_output.logits
-    target_cache = target_model_output.past_key_values
+    if use_cache:
+        target_cache = target_model_output.past_key_values
 
     draft_output = draft_model(
         input_ids = input_ids[:, :batch_position],
@@ -659,7 +660,8 @@ def speculative_generate_batch_v3(
         past_key_values = draft_cache,
         use_cache = use_cache,
     )
-    draft_cache = draft_output.past_key_values
+    if use_cache:
+        draft_cache = draft_output.past_key_values
 
     # get new token from end of target_model output
     new_tok_probs = logits_processor(target_model_logits[:, -1])
@@ -681,7 +683,7 @@ def speculative_generate_batch_v3(
         live.start()
 
     active_status = torch.full((B, ), True, dtype=torch.bool, device=device)
-    active_status &= (new_token_batch != eos_tokens_id)
+    active_status &= (new_token_batch != eos_token_id)
 
     Q = torch.zeros(size=(B, gamma+1, vocab_size), device=device, dtype=target_model.dtype)
 
@@ -699,19 +701,28 @@ def speculative_generate_batch_v3(
         draft_lengths = torch.full_like(active_indices, 0, device=device)
 
         # Crop both caches to batch_position - 1
-        target_cache.crop(batch_position - 1)
-        draft_cache.crop(batch_position - 2)
+        if use_cache:
+            target_cache.crop(batch_position - 1)
+            draft_cache.crop(batch_position - 2)
 
         pos_id = (attn_mask[:, :batch_position].sum(dim=1) - 1).unsqueeze(1)
 
         for k in range(draft_steps):
-            if k == 0:
+            if not use_cache:
+                # Without cache, feed full sequence up to current draft position
+                seq_len = batch_position + k
+                draft_output = draft_model(
+                    input_ids=input_ids[:, :seq_len],
+                    attention_mask=attn_mask[:, :seq_len],
+                    position_ids=(attn_mask[:, :seq_len].cumsum(dim=1) - 1).clamp(min=0),
+                    use_cache=False,
+                )
+            elif k == 0:
                 draft_output = draft_model(
                     input_ids=input_ids[:, batch_position-2:batch_position],
                     attention_mask=attn_mask[:, :batch_position],
                     use_cache=use_cache,
                     past_key_values=draft_cache,
-                    # cache_position=torch.tensor([batch_position - 2, batch_position - 1], device=device),
                     position_ids=(attn_mask[:, :batch_position].cumsum(dim=1)-1)[:, batch_position-2:batch_position],
                     output_hidden_states=False,
                     output_attentions=False,
@@ -724,25 +735,24 @@ def speculative_generate_batch_v3(
                     past_key_values=draft_cache,
                     use_cache=use_cache,
                 )
-            # draft_cache = draft_output.past_key_values
 
             draft_logits = draft_output.logits[active_indices]
             Q[active_indices, k] = logits_processor(draft_logits[:, -1])
 
             new_token_batch = logits_processor.sample(Q[active_indices, k])
-            new_token_batch = torch.where(draft_active, new_token_batch, eos_tokens_id)
+            new_token_batch = torch.where(draft_active, new_token_batch, eos_token_id)
 
             input_ids[active_indices, batch_position+k] = new_token_batch
             attn_mask[active_indices, batch_position+k] = 1
             draft_lengths += draft_active
-            draft_active &= (new_token_batch != eos_tokens_id)
+            draft_active &= (new_token_batch != eos_token_id)
 
         drafts_speculated[active_indices] += draft_lengths
 
         # Target model verification
         mask = attn_mask[:, :batch_position+draft_steps]
         pos_id = (mask.cumsum(dim=1) - 1).clamp(min=0)
-        target_cache_len = target_cache.get_seq_length()
+        target_cache_len = target_cache.get_seq_length() if use_cache else 0
 
         target_model_output = target_model(
             input_ids=input_ids[:, target_cache_len:batch_position+draft_steps],
@@ -751,7 +761,8 @@ def speculative_generate_batch_v3(
             past_key_values=target_cache,
             use_cache=use_cache,
         )
-        target_cache = target_model_output.past_key_values
+        if use_cache:
+            target_cache = target_model_output.past_key_values
 
         # Extract logits for verification positions
         start_offset = batch_position - 1 - target_cache_len
@@ -786,7 +797,7 @@ def speculative_generate_batch_v3(
 
         drafted_tokens = input_ids[active_indices, batch_position:batch_position+draft_steps]
         eos_positions = torch.where(
-            drafted_tokens == eos_tokens_id,
+            drafted_tokens == eos_token_id,
             torch.arange(draft_steps, device=device),
             max_seq_length
         ).min(dim=1).values
@@ -797,7 +808,7 @@ def speculative_generate_batch_v3(
             eos_positions+1,
             num_accepted
         )
-        active_status[active_indices] &= ~(has_eos | (extra_tokens == eos_tokens_id))
+        active_status[active_indices] &= ~(has_eos | (extra_tokens == eos_token_id))
         drafts_accepted[active_indices] += accepted_draft_length
         num_blocks[active_indices] += 1
 
@@ -949,7 +960,7 @@ def speculative_generate_batch_v4(
 
     if debug:
         console = Console()
-        header = Text(f"Batch Speculative decoding v3 | 0.00 tokens/s", style="bold magenta")
+        header = Text(f"Batch Speculative decoding v4 | 0.00 tokens/s", style="bold magenta")
         texts = [Text(tokenizer.decode(new_token_batch[b], skip_special_tokens=True)) for b in range(B)]
         panels = [Panel(texts[i], border_style="cyan", title=f"Prompt {i+1}") for i in range(B)]
         group = Group(header, *panels)
