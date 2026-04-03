@@ -1,3 +1,3 @@
 from .base_decoding import autoregressive_generate
-from .speculative_decoding import speculative_generate_batch
+from .speculative_decoding import speculative_generate_batch, speculative_generate_batch_v2, speculative_generate_batch_v3 ,speculative_generate_batch_v4
 from .logits_processor import NucleusProcessor, GreedyProcessor
